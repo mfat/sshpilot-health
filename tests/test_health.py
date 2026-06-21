@@ -72,6 +72,32 @@ def test_tcp_check_empty_host_is_down():
     assert mod.tcp_check("", 22) is False
 
 
+def test_classify_health():
+    mod = _load()
+    # No TCP -> down, regardless of SSH.
+    assert mod.classify_health(False, None, True) == "down"
+    assert mod.classify_health(False, True, True) == "down"
+    # TCP ok, SSH probed and failed -> tcp only.
+    assert mod.classify_health(True, False, True) == "tcp"
+    # TCP ok, SSH ok -> up.
+    assert mod.classify_health(True, True, True) == "up"
+    # SSH not probed (non-ssh proto or disabled) -> TCP alone counts as up.
+    assert mod.classify_health(True, None, False) == "up"
+
+
+def test_ssh_probe_argv():
+    mod = _load()
+    argv = mod.ssh_probe_argv("prod-web", timeout=3, config="/cfg")
+    assert argv[0] == "ssh"
+    assert "-F" in argv and "/cfg" in argv
+    assert "BatchMode=yes" in argv
+    assert "ConnectTimeout=3" in argv
+    assert argv[-2:] == ["prod-web", "true"]   # nickname as target, runs `true`
+    # Flatpak prefix wraps the whole command.
+    fp = mod.ssh_probe_argv("h", flatpak_prefix=True)
+    assert fp[:3] == ["flatpak-spawn", "--host", "ssh"]
+
+
 def test_tcp_check_bad_port_defaults_to_22(monkeypatch):
     mod = _load()
     seen = {}

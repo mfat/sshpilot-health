@@ -21,9 +21,13 @@ because neither needs a display.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import socket
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from sshpilot.plugins.api import Events, PluginContext, SshPilotPlugin
 
@@ -53,6 +57,43 @@ def tcp_check(host: str, port: int, timeout: float = CHECK_TIMEOUT) -> bool:
         return False
 
 
+def _is_flatpak() -> bool:
+    return bool(os.environ.get("FLATPAK_ID")) or os.path.exists("/.flatpak-info")
+
+
+def ssh_probe_argv(target: str, *, timeout: float = CHECK_TIMEOUT,
+                   config: Optional[str] = None,
+                   flatpak_prefix: bool = False) -> list:
+    """Build the argv that tests an actual SSH handshake without a shell:
+    ``ssh -F <config> -o BatchMode=yes -o ConnectTimeout=N
+    -o StrictHostKeyChecking=accept-new <target> true``. Passing the connection's
+    nickname as ``target`` lets ssh apply its ~/.ssh/config (ProxyJump,
+    IdentityFile, port) so bastioned hosts probe correctly."""
+    cfg = config or os.path.join(os.path.expanduser("~"), ".ssh", "config")
+    argv = [
+        "ssh", "-F", cfg,
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={max(1, int(timeout))}",
+        "-o", "StrictHostKeyChecking=accept-new",
+        target, "true",
+    ]
+    if flatpak_prefix:
+        argv = ["flatpak-spawn", "--host", *argv]
+    return argv
+
+
+def classify_health(tcp_ok: bool, ssh_ok: Optional[bool], is_ssh: bool) -> str:
+    """Combine the probe results into a display state:
+    ``"down"`` (no TCP), ``"tcp"`` (TCP open but SSH not ready), or ``"up"``.
+    ``ssh_ok`` is None when the SSH probe wasn't run (non-SSH protocol or SSH
+    checking disabled) — then TCP reachability alone counts as up."""
+    if not tcp_ok:
+        return "down"
+    if is_ssh and ssh_ok is False:
+        return "tcp"
+    return "up"
+
+
 # --- plugin -----------------------------------------------------------------
 
 class Plugin(SshPilotPlugin):
@@ -67,6 +108,7 @@ class Plugin(SshPilotPlugin):
         self._timeout = self._read_float("timeout", CHECK_TIMEOUT)
         self._interval = self._read_float("interval", REFRESH_INTERVAL)
         self._pause_when_hidden = bool(ctx.settings.get("pause_when_hidden", True))
+        self._check_ssh = bool(ctx.settings.get("check_ssh", True))
         self._page_visible = True
 
         ctx.ui.register_page(
@@ -152,8 +194,15 @@ class Plugin(SshPilotPlugin):
             subtitle="Stop probing while the Health tab isn't visible")
         self._pause_row.set_active(self._pause_when_hidden)
         self._pause_row.connect("notify::active", self._on_pause_toggled)
+        self._ssh_row = Adw.SwitchRow(
+            title="Check SSH, not just the port",
+            subtitle="Also attempt an SSH handshake (honours ProxyJump); shows "
+                     "‘TCP only’ when the port is open but SSH isn't ready")
+        self._ssh_row.set_active(self._check_ssh)
+        self._ssh_row.connect("notify::active", self._on_ssh_toggled)
         settings.add(self._timeout_row)
         settings.add(self._interval_row)
+        settings.add(self._ssh_row)
         settings.add(self._pause_row)
         box.append(settings)
 
@@ -218,6 +267,11 @@ class Plugin(SshPilotPlugin):
         self._pause_when_hidden = row.get_active()
         self.ctx.settings.set("pause_when_hidden", self._pause_when_hidden)
 
+    def _on_ssh_toggled(self, row, _param) -> None:
+        self._check_ssh = row.get_active()
+        self.ctx.settings.set("check_ssh", self._check_ssh)
+        self._tick()  # re-probe with the new mode
+
     # --- UI thread work ---------------------------------------------------
     def _tick(self) -> None:
         """Rebuild the row list from the current connections and dispatch a
@@ -268,24 +322,64 @@ class Plugin(SshPilotPlugin):
             self._rows[info.nickname] = status
 
             if executor is not None and not self._stop.is_set():
-                executor.submit(self._check_one, info.nickname, info.host, info.port)
+                executor.submit(self._check_one, info.nickname, info.host,
+                                info.port, getattr(info, "protocol", "ssh"))
 
-    def _check_one(self, nickname: str, host: str, port: int) -> None:
-        """Runs on a worker thread."""
-        up = tcp_check(host, port, self._timeout)
+    def _check_one(self, nickname: str, host: str, port: int,
+                   protocol: str) -> None:
+        """Runs on a worker thread: TCP first, then (for SSH connections, if
+        enabled) an SSH handshake, so we can tell 'port open' from 'SSH ready'."""
+        tcp_ok = tcp_check(host, port, self._timeout)
+        probe_ssh = (protocol == "ssh") and self._check_ssh
+        ssh_ok = None
+        detail = ""
+        if tcp_ok and probe_ssh:
+            ssh_ok, detail = self._ssh_check(nickname)
+        state = classify_health(tcp_ok, ssh_ok, probe_ssh)
         if not self._stop.is_set():
-            self.ctx.run_on_ui_thread(self._update_row, nickname, up)
+            self.ctx.run_on_ui_thread(self._update_row, nickname, state, detail)
 
-    def _update_row(self, nickname: str, up: bool) -> None:
+    def _ssh_check(self, nickname: str):
+        """Runs on a worker thread. Returns (ok, detail). ok is True if an SSH
+        handshake to the connection succeeds (BatchMode, via ~/.ssh/config so
+        ProxyJump is honoured), False otherwise, with a short reason in detail."""
+        ssh = shutil.which("ssh")
+        flatpak_prefix = False
+        if not ssh and _is_flatpak() and shutil.which("flatpak-spawn"):
+            ssh, flatpak_prefix = "ssh", True
+        if not ssh:
+            return None, "ssh not found"
+        argv = ssh_probe_argv(nickname, timeout=self._timeout,
+                              flatpak_prefix=flatpak_prefix)
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=self._timeout * 2 + 5, check=False)
+        except subprocess.TimeoutExpired:
+            return False, "SSH timed out"
+        except (FileNotFoundError, OSError) as exc:
+            return None, str(exc)
+        if result.returncode == 0:
+            return True, ""
+        err = (result.stderr or "").strip()
+        detail = err.splitlines()[-1] if err else f"ssh exit {result.returncode}"
+        return False, detail
+
+    def _update_row(self, nickname: str, state: str, detail: str = "") -> None:
         status = self._rows.get(nickname)
         if status is None:
             return
-        status.remove_css_class("dim-label")
-        status.remove_css_class("success")
-        status.remove_css_class("error")
-        if up:
+        for cls in ("dim-label", "success", "error", "warning"):
+            status.remove_css_class(cls)
+        if state == "up":
             status.set_label("● Up")
             status.add_css_class("success")
+            status.set_tooltip_text("Reachable")
+        elif state == "tcp":
+            status.set_label("● TCP only")
+            status.add_css_class("warning")
+            status.set_tooltip_text(detail or "Port open, but SSH isn't ready")
         else:
             status.set_label("● Down")
             status.add_css_class("error")
+            status.set_tooltip_text(detail or "Unreachable")

@@ -1,7 +1,19 @@
 # Host Health Dashboard (sshPilot plugin)
 
-A page that lists every saved connection and shows whether its `host:port`
-accepts a TCP connection — refreshed automatically in the background.
+A page that lists every saved connection and shows its reachability, refreshed
+automatically in the background. Each host has three states:
+
+- **Up** — reachable (and, for SSH connections with "Check SSH" on, the SSH
+  handshake succeeds).
+- **TCP only** — the port is open but SSH isn't ready (sshd not responding, auth
+  refused, …); hover for the reason. This distinguishes "port reachable" from
+  "actually usable."
+- **Down** — no TCP connection at all.
+
+With **Check SSH** enabled (default) the SSH probe runs through your
+`~/.ssh/config` using the connection's nickname, so **ProxyJump/bastioned hosts
+are tested correctly** (a plain TCP probe would wrongly show them Down). Turn it
+off for a faster, port-only check.
 
 A worked example of doing network work off the UI thread and shutting worker
 threads down cleanly on quit.
